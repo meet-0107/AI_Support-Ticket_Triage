@@ -8,26 +8,18 @@ The service handles incoming customer support requests, performs background tria
 
 ## 🚀 Key Features
 
-- **Multi-Tenant Security**: Enforces tenant isolation on all operations via `x-api-key` authentication headers (`key_acme`, `key_beta`).
-- **Async Queue & Processing**: Accepts incoming tickets with HTTP 202 (`queued`), offloading processing to asynchronous background tasks and Celery workers.
-- **Resilient AI Triage Pipeline**:
-  - Predicts ticket `category` (`billing`, `technical`, `account`, `feature_request`, `other`), `priority` (`urgent`, `high`, `low`), and generates a concise `summary`.
-  - Self-healing repair loop: automatically triggers 1 retry on malformed model outputs before escalating to `needs_review` (`schema_invalid_after_repair`).
-  - Graceful handling of timeouts (`timeout`) and low confidence outputs (`low_confidence`).
-- **Duplicate Detection & Chain Resolution**:
-  - Automatically compares incoming tickets with recent tickets from the same customer over a 7-day window using cosine similarity.
-  - Matches $\ge 0.9$ similarity resolve transitively to the canonical root ticket (`duplicate_of`).
-- **Semantic Vector Search**: Generates 256-dimensional L2-normalized embeddings to rank and return relevant tickets for any query string.
-- **Idempotency Protection**: Optional `Idempotency-Key` header prevents duplicate ticket creation on network retries.
-- **Background Worker Engine**:
-  - Includes both an in-process asyncio worker and Celery distributed tasks.
-  - Built-in crash recovery: automatically resets tickets stuck in `processing` (> 30s) back to `queued`.
+- **Multi-Tenant Security**: Strict data isolation per tenant using `x-api-key` authentication.
+- **Async Processing**: Fast HTTP 202 responses with background processing via Asyncio and Celery.
+- **AI-Powered Triage**: Automated classification of category, priority, and summary with strict schema validation.
+- **Self-Healing LLM Loop**: Automatic repair retry on invalid model responses with fallback to review.
+- **Duplicate Detection**: 7-day sliding window similarity matching with transitive root chain resolution.
+- **Semantic Vector Search**: Fast similarity-based search powered by 256-dimensional embeddings.
+- **Idempotent Requests**: Header-based protection (`Idempotency-Key`) against duplicate ticket creation.
+- **Fault-Tolerant Workers**: Built-in crash recovery that auto-resets stuck jobs back to the queue.
 
 ---
 
 ## 🏛️ System Architecture
-
-A single, clean, end-to-end architecture representing the complete lifecycle: from authenticated client ingestion, asynchronous queuing, and crash recovery, to vector duplicate resolution, self-healing LLM classification, and semantic vector search.
 
 ```mermaid
 flowchart TD
