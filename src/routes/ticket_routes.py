@@ -24,19 +24,17 @@ async def create_ticket(
     background_tasks: BackgroundTasks,
     tenant_id: str = Depends(get_current_tenant),
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
-    x_idempotency_key: Optional[str] = Header(None, alias="X-Idempotency-Key"),
 ):
     """Submits a new ticket for triage.
 
     Validates schema, checks idempotency, queues background processing,
     and returns HTTP 202 with ticket ID and queued status.
     """
-    effective_idempotency = idempotency_key or x_idempotency_key
     return await ticket_controller.create_ticket(
         payload=payload,
         tenant_id=tenant_id,
         background_tasks=background_tasks,
-        idempotency_key=effective_idempotency,
+        idempotency_key=idempotency_key,
     )
 
 
