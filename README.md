@@ -97,18 +97,6 @@ flowchart TD
     Client <-->|"GET /tickets/search (Cosine ranking)"| DB
 ```
 
-### Stage-by-Stage Processing Breakdown
-
-| Stage | Responsibility | Failure & Fallback Handling |
-| :--- | :--- | :--- |
-| **Ingestion** | Enforces `x-api-key` tenant isolation, Pydantic field validation, and optional idempotency deduplication. Immediately returns HTTP 202 (`queued`). | HTTP 401 on missing/invalid key; HTTP 400 with granular field errors; cached ticket on duplicate `Idempotency-Key`. |
-| **Worker Engine** | Pulls `queued` tickets, transitions status to `processing`. Includes periodic recovery resetting tickets stuck in `processing` > 30s back to `queued`. | Prevents lost tasks during worker restarts, crashes, or unhandled exceptions. |
-| **Stage 1: Embedding** | Converts ticket `subject` + `body` into a 256-dimensional L2-normalized vector using configured provider (Gemini, Ollama, or Mock). | Fallback embedding providers configurable via `.env`. |
-| **Stage 2: Duplicate Detection** | Scans tickets for the same `(tenant_id, customer_email)` within a 7-day sliding window. Calculates cosine similarity; if $\ge 0.90$, recursively resolves parent links to the canonical root ticket. | If no match $\ge 0.90$, ticket remains standalone (`duplicate_of: null`). Handles circular links with depth bounds. |
-| **Stage 3: LLM Triage** | Invokes LLM with strict JSON schema instructions to classify `category`, assign `priority`, draft `summary`, and output `confidence`. | <ul><li>**Timeout**: 5s limit triggers fallback to `needs_review` (`timeout`).</li><li>**Invalid Schema**: 1x automatic repair retry with corrective prompt before fallback to `needs_review` (`schema_invalid_after_repair`).</li><li>**Low Confidence**: Confidence $< 0.70$ routes to `needs_review` (`low_confidence`).</li></ul> |
-| **Stage 4: Persistence** | Atomically updates ticket record with triage results, raw embedding vector JSON, duplicate resolution, and attempt count. | SQLite row update within isolated tenant scope. |
-| **Semantic Search** | Embeds incoming query `q`, computes cosine similarity against all triaged tenant tickets, and returns top-$K$ matches. | Input validation (2–200 chars, limit 1–20); tenant boundary strictly preserved. |
-
 ---
 
 ## 📁 Directory Structure
@@ -425,34 +413,4 @@ curl -X GET "http://localhost:8000/tickets/some-id"
 
 ---
 
-## 🏗 Key Assumptions & Architectural Trade-offs at 1M Ticket Scale
 
-### 1. Multi-Tenancy & Data Isolation
-- **Current Approach**: Row-level tenant partitioning (`tenant_id` column with composite index on `(tenant_id, customer_email, created_at)`).
-- **Scale Trade-off (1M+ Tickets)**:
-  - Row-level multitenancy in a single SQLite file reaches locking limits (SQLite single-writer bottleneck).
-  - *Recommendation at 1M Scale*: Migrate to **PostgreSQL with Schema-per-Tenant** or **Database-per-Tenant** for enterprise tiers, with Row-Level Security (RLS) enabled.
-
-### 2. Semantic Search & Vector Embeddings
-- **Current Approach**: 256-dimensional embeddings stored as JSON strings in SQLite, scored with Python in-memory brute-force cosine similarity.
-- **Scale Trade-off (1M+ Tickets)**:
-  - Scanning $10^6$ rows in Python consumes significant memory ($O(N)$ comparisons) and degrades response times ($>500\text{ms}$).
-  - *Recommendation at 1M Scale*: Adopt a dedicated vector index such as **pgvector (HNSW / IVFFlat)**, **Qdrant**, or **Pinecone**. Approximate Nearest Neighbor (ANN) index reduces search latency to $<10\text{ms}$ with logarithmic $O(\log N)$ scaling.
-
-### 3. Queueing & Background Workers
-- **Current Approach**: Dual engine support—in-process `BackgroundTasks` alongside Celery with Redis broker and periodic stuck-processing recovery.
-- **Scale Trade-off (1M+ Tickets)**:
-  - In-process tasks are tied to the web worker process lifecycle and risk task loss during process restarts or crashes.
-  - *Recommendation at 1M Scale*: Decouple fully with distributed message brokers like **Redis Streams**, **RabbitMQ**, or **Apache Kafka** with dead-letter queues (DLQ), consumer autoscaling (KEDA), and rate-limiting per tenant.
-
-### 4. LLM Resilience & Rate Limiting
-- **Current Approach**: Single-shot repair retry loop with 5-second timeout and fallback to `needs_review`.
-- **Scale Trade-off (1M+ Tickets)**:
-  - At high volume, external LLM providers enforce tight RPM/TPM rate limits and experience transient network latency.
-  - *Recommendation at 1M Scale*: Implement an exponential backoff circuit breaker (e.g. `tenacity`), token-bucket rate limiter per tenant, and fallback to quantized local open-source models (e.g. Mistral/Llama via vLLM) for low-complexity tier classification.
-
-### 5. Duplicate Detection & Windowing
-- **Current Approach**: 7-day sliding window query on `(tenant_id, customer_email, created_at)`.
-- **Scale Trade-off (1M+ Tickets)**:
-  - High-frequency support customers generate large candidate lists over 7 days.
-  - *Recommendation at 1M Scale*: Pre-filter candidate tickets by customer ID with a partition index and prune closed/resolved tickets older than 48 hours to minimize vector distance calculations.
