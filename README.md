@@ -25,290 +25,79 @@ The service handles incoming customer support requests, performs background tria
 
 ---
 
-## 🏛️ End-to-End System Architecture
+## 🏛️ System Architecture
 
-Comprehensive architecture diagrams illustrating the complete, end-to-end working flow of the **AI Support Ticket Triage Service**: from authenticated client ingestion, asynchronous queueing, and crash recovery, through vector duplicate resolution, self-healing LLM triage, and semantic search retrieval.
-
-<div align="center">
-  <img src="assets/architecture_diagram.svg" alt="AI Support Ticket Triage - End-to-End System Architecture" width="100%"/>
-</div>
-
----
-
-### 1. Visual Architecture Blueprint
-
-```text
-+-------------------------------------------------------------------------------------------------------------------+
-|                                 AI SUPPORT TICKET TRIAGE - SYSTEM ARCHITECTURE                                    |
-+-------------------------------------------------------------------------------------------------------------------+
-|                                                                                                                   |
-|  [ CLIENT LAYER ]                                                                                                 |
-|   Support Portal / CRM / Webhook Integration                                                                      |
-|         │                                                                                                         |
-|         │ POST /tickets (x-api-key: key_acme, Idempotency-Key: uuid, JSON payload)                                |
-|         ▼                                                                                                         |
-|  [ FASTAPI APPLICATION LAYER ]                                                                                    |
-|  ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐  |
-|  │  1. Multi-Tenant Auth Guard: Validate 'x-api-key' against 'tenants' table (key_acme, key_beta)                │  |
-|  │  2. Payload Validation: Pydantic TicketCreate schema (subject >= 3, body >= 10, valid customerEmail)          │  |
-|  │  3. Idempotency Gate: If Idempotency-Key exists, return cached ticket record immediately                   │  |
-|  │  4. Enqueue Ticket: INSERT INTO tickets (status = 'queued') ────────────────────────┐                      │  |
-|  │  5. Immediate Client Response: HTTP 202 Accepted { "id": "uuid", "status": "queued" }                      │  |
-|  └───────────────────────────────────────────────────┬─────────────────────────────────│──────────────────────┘  |
-|                                                      │ (async dispatch)                │ (INSERT status: queued)  |
-|                                                      ▼                                 ▼                          |
-|  [ ASYNC WORKER ENGINE ]                                                    [ PERSISTENCE LAYER ]                 |
-|  ┌──────────────────────────────────────────────────────────┐               ┌──────────────────────────────────┐  |
-|  │ • In-Process Asyncio Worker (ticket_worker.py polling)   │               │ SQLite Database (tickets.db)     │  |
-|  │ • Distributed Celery Worker (celery_worker.py via Redis) │ ◄────────────►│  • tenants table (isolation)     │  |
-|  │ • Stuck Ticket Crash Recovery (> 30s processing -> reset)│               │  • tickets table                 │  |
-|  └──────────────────────────┬───────────────────────────────┘               │    - status, category, priority  │  |
-|                             │ Marks status = 'processing'                   │    - 256-dim embedding (JSON)    │  |
-|                             ▼                                               │    - duplicate_of, score         │  |
-|  [ CORE TRIAGE PIPELINE (TriageService) ]                                   └────────────────┬─────────────────┘  |
-|  ┌───────────────────────────────────────────────────────────────────────────────────────────│─────────────────┐  |
-|  │                                                                                           │                 │  |
-|  │  STAGE 1: VECTOR EMBEDDING GENERATION                                                     │                 │  |
-|  │  Concatenate subject + body  ──►  Generate 256-dimensional L2-normalized float vector     │                 │  |
-|  │                                                                                           │                 │  |
-|  │  STAGE 2: DUPLICATE DETECTION & TRANSITIVE CHAIN RESOLUTION                              │                 │  |
-|  │  1. Query customer tickets within 7-day sliding window  ──────────────────────────────────┘                 │  |
-|  │  2. Calculate Cosine Similarity against recent candidate embeddings                                         │  |
-|  │  3. If similarity >= 0.90: Traverse duplicate_of links to canonical root ticket                             │  |
-|  │     (Example: C -> B and B -> A  ==>  C resolves directly to canonical root ticket A)                      │  |
-|  │                                                                                                             │  |
-|  │  STAGE 3: LLM CLASSIFICATION & SELF-HEALING REPAIR LOOP                                                     │  |
-|  │  • Attempt 1: Call LLM with strict JSON schema (5.0s timeout limit)                                         │  |
-|  │  • Timeout or Provider error? ──► Escalate to 'needs_review' (triage_error: 'timeout')                      │  |
-|  │  • Schema ValidationError?    ──► Attempt 2: Auto-inject repair prompt with schema instructions            │  |
-|  │  • Still invalid schema?      ──► Escalate to 'needs_review' (triage_error: 'schema_invalid_after_repair') │  |
-|  │  • Confidence score < 0.70?   ──► Escalate to 'needs_review' (triage_error: 'low_confidence')              │  |
-|  │  • Valid & Confidence >= 0.70 ──► Mark status = 'triaged' (assign category, priority, summary)              │  |
-|  │                                                                                                             │  |
-|  │  STAGE 4: PERSISTENCE & UPDATES                                                                             │  |
-|  │  UPDATE tickets SET status, category, priority, summary, confidence, embedding, duplicate_of...             │  |
-|  └─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘  |
-|                                                                                                                   |
-|  [ READ & SEMANTIC SEARCH ]                                                                                       |
-|   • GET /tickets/{id}         ──► Returns ticket status & triage metadata (raw vector omitted)                    |
-|   • GET /tickets/search?q=... ──► Generates 256-dim query embedding & ranks tickets by Cosine Similarity          |
-+-------------------------------------------------------------------------------------------------------------------+
-```
-
----
-
-### 2. High-Level Component Flowchart (Interactive)
-
-```mermaid
-flowchart TB
-    subgraph Clients["🌐 Clients & Integrations"]
-        Client["Client Application / Support Portal / Webhook"]
-    end
-
-    subgraph APIGateway["⚡ FastAPI Application Layer"]
-        AuthMiddleware["Tenant Auth Dependency<br/><code>x-api-key: key_acme | key_beta</code>"]
-        IdempMiddleware["Idempotency Gate<br/><code>Idempotency-Key Header</code>"]
-        TicketRouter["Ticket Routes<br/><code>POST /tickets</code><br/><code>GET /tickets/{id}</code><br/><code>GET /tickets/search</code>"]
-        Controller["Ticket Controller<br/>Pydantic Validation & Dispatch"]
-    end
-
-    subgraph DataStorage["💾 Persistence Layer (SQLite)"]
-        SQLiteDB[("SQLite Database<br/><code>tickets.db</code>")]
-        TenantsTable[("tenants table<br/><code>tenant_id</code>, <code>api_key</code>, <code>name</code>")]
-        TicketsTable[("tickets table<br/>tickets, JSON embeddings,<br/>triage status & metadata")]
-    end
-
-    subgraph AsyncExecution["⚙️ Asynchronous Worker Engine"]
-        InProcessWorker["Asyncio Background Worker<br/><code>TicketWorker (polling loop)</code>"]
-        CeleryWorker["Celery Worker Engine<br/>Distributed Queue (Redis Broker)"]
-        CrashRecovery["Stuck Ticket Recovery<br/>Reset <code>processing > 30s</code> ➔ <code>queued</code>"]
-    end
-
-    subgraph Pipeline["🧠 Core Triage Engine (TriageService)"]
-        EmbedStep["Stage 1: Vector Embedding<br/>Generate 256-dim L2-normalized vector"]
-        DuplicateStep["Stage 2: Duplicate Detection<br/>7-day sliding window & Cosine &ge; 0.9<br/>Transitive chain resolution"]
-        LLMStep["Stage 3: LLM Triage & Repair Loop<br/>Timeout 5s &bull; Schema validation<br/>1x Repair retry &bull; Confidence check &ge; 0.7"]
-    end
-
-    subgraph ExternalAI["🤖 AI & Embedding Providers"]
-        AIProviders["Google Gemini / Ollama / Local Models<br/>LLM Classification & Vector Embeddings"]
-    end
-
-    %% Connections
-    Client -->|"HTTP POST / GET<br/>x-api-key, Idempotency-Key"| AuthMiddleware
-    AuthMiddleware -->|"Verify Tenant Key"| TenantsTable
-    AuthMiddleware -->|"Authorized Context"| IdempMiddleware
-    IdempMiddleware --> TicketRouter
-    TicketRouter --> Controller
-
-    Controller -->|"Check Key & Insert (status: queued)"| TicketsTable
-    Controller -->|"HTTP 202 Accepted {id, status}"| Client
-
-    Controller -.->|"BackgroundTasks.add_task()"| InProcessWorker
-    Controller -.->|"Celery .delay() (Optional)"| CeleryWorker
-
-    InProcessWorker -->|"Poll queued tickets"| TicketsTable
-    CeleryWorker -->|"Fetch queued tickets"| TicketsTable
-    CrashRecovery -.->|"Auto-recover stuck tickets"| TicketsTable
-
-    InProcessWorker -->|"Mark status: processing"| Pipeline
-    CeleryWorker -->|"Mark status: processing"| Pipeline
-
-    Pipeline --> EmbedStep
-    EmbedStep <-->|"Generate Embeddings"| AIProviders
-    EmbedStep --> DuplicateStep
-    DuplicateStep <-->|"Query customer 7-day history"| TicketsTable
-    DuplicateStep --> LLMStep
-    LLMStep <-->|"Classify, Prioritize, Summarize"| AIProviders
-    LLMStep -->|"Persist status, category, priority, embedding"| TicketsTable
-
-    Client -->|"GET /tickets/search?q=query"| Controller
-    Controller <-->|"Vector cosine ranking"| TicketsTable
-```
-
----
-
-### 3. End-to-End Ticket Lifecycle & Decision Flowchart
+A single, clean, end-to-end architecture representing the complete lifecycle: from authenticated client ingestion, asynchronous queuing, and crash recovery, to vector duplicate resolution, self-healing LLM classification, and semantic vector search.
 
 ```mermaid
 flowchart TD
-    Start(["📥 Client Submits Ticket<br/>POST /tickets"]) --> Auth{"🔑 Valid x-api-key?"}
+    %% Styling
+    classDef client fill:#e0f2fe,stroke:#0284c7,stroke-width:2px,color:#0369a1;
+    classDef api fill:#f0fdf4,stroke:#16a34a,stroke-width:2px,color:#15803d;
+    classDef worker fill:#fef3c7,stroke:#d97706,stroke-width:2px,color:#b45309;
+    classDef pipeline fill:#f5f3ff,stroke:#7c3aed,stroke-width:2px,color:#6d28d9;
+    classDef storage fill:#f1f5f9,stroke:#475569,stroke-width:2px,color:#334155;
+    classDef provider fill:#fdf2f8,stroke:#db2777,stroke-width:2px,color:#be185d;
+    classDef state fill:#ffffff,stroke:#64748b,stroke-width:2px,stroke-dasharray: 4 4,color:#0f172a;
 
-    Auth -- "No" --> ErrAuth["Return HTTP 401 Unauthorized<br/>{ detail: 'Missing or invalid API key' }"]
-    Auth -- "Yes" --> ValPayload{"📋 Valid Payload?<br/>(Pydantic Schema)"}
-
-    ValPayload -- "No" --> ErrPayload["Return HTTP 400 Bad Request<br/>Field-level error list (subject, body, email)"]
-    ValPayload -- "Yes" --> CheckIdemp{"🔁 Idempotency Key<br/>Supplied & Cached?"}
-
-    CheckIdemp -- "Yes (Replay)" --> ReturnExisting["Return Existing Ticket (HTTP 200/202)<br/>{ id, status }"]
-    CheckIdemp -- "No (New)" --> InsertQueued["Insert Ticket into DB<br/>Status: 'queued'"]
-    InsertQueued --> Resp202["Return HTTP 202 Accepted<br/>{ id: uuid, status: 'queued' }"]
-
-    Resp202 --> WorkerPick["⚙️ Background Worker / Celery Picks Up Ticket<br/>Atomic DB Update: status ➔ 'processing'"]
-
-    subgraph TriagePipeline["🧠 Resilient Triage Pipeline Execution"]
-        WorkerPick --> GenEmbedding["Stage 1: Generate Vector Embedding<br/>(256-dimensional L2-normalized vector)"]
-        GenEmbedding --> FetchHistory["Query customer tickets within<br/>7-day sliding window for tenant"]
-        FetchHistory --> CalcCosine["Compute Cosine Similarity against candidates"]
-        CalcCosine --> DupCheck{"Highest Similarity<br/>&ge; 0.90?"}
-
-        DupCheck -- "Yes" --> ResolveChain["Resolve Transitive Duplicate Chain<br/>(e.g., C &rarr; B &rarr; A &rArr; canonical root A)<br/>duplicate_of = root_id, duplicate_score = sim"]
-        DupCheck -- "No" --> NoDup["duplicate_of = null<br/>duplicate_score = null"]
-
-        ResolveChain --> CallLLM1["Stage 3: LLM Triage (Attempt 1)<br/>Timeout limit: 5.0 seconds"]
-        NoDup --> CallLLM1
-
-        CallLLM1 --> CheckTimeout1{"Timeout or<br/>Network Failure?"}
-        CheckTimeout1 -- "Timeout" --> MarkReviewTimeout["status = 'needs_review'<br/>triage_error = 'timeout'"]
-        CheckTimeout1 -- "Completed" --> ValidateSchema1{"Valid Pydantic Schema?<br/>(category, priority, summary)"}
-
-        ValidateSchema1 -- "Valid JSON" --> CheckConfidence{"Confidence Score<br/>&ge; 0.70?"}
-        ValidateSchema1 -- "Invalid Schema" --> CallLLM2["Self-Healing Repair (Attempt 2)<br/>Inject corrective schema prompt"]
-
-        CallLLM2 --> CheckTimeout2{"Timeout or<br/>Provider Error?"}
-        CheckTimeout2 -- "Timeout" --> MarkReviewTimeout
-        CheckTimeout2 -- "Still Invalid" --> MarkReviewSchema["status = 'needs_review'<br/>triage_error = 'schema_invalid_after_repair'"]
-        CheckTimeout2 -- "Repaired Valid" --> CheckConfidence
-
-        CheckConfidence -- "&ge; 0.70" --> MarkTriaged["status = 'triaged'<br/>Assign category, priority, summary"]
-        CheckConfidence -- "< 0.70" --> MarkReviewConf["status = 'needs_review'<br/>triage_error = 'low_confidence'"]
+    subgraph ClientLayer["🌐 Client Layer"]
+        Client["Client / CRM / Webhook<br/><code>POST /tickets</code> | <code>GET /tickets/{id}</code> | <code>GET /tickets/search</code>"]:::client
     end
 
-    MarkTriaged --> SaveDB["💾 Persist final updates to DB<br/>(status, category, priority, summary, confidence,<br/>duplicate_of, embedding vector JSON, llm_attempts)"]
-    MarkReviewTimeout --> SaveDB
-    MarkReviewSchema --> SaveDB
-    MarkReviewConf --> SaveDB
+    subgraph APILayer["⚡ FastAPI Gateway Layer"]
+        Auth["1. Tenant Auth Guard<br/>Validate <code>x-api-key</code>"]:::api
+        Validator["2. Pydantic Validator<br/>Field lengths, types, email"]:::api
+        Idemp["3. Idempotency Gate<br/>Check <code>Idempotency-Key</code>"]:::api
+    end
 
-    SaveDB --> End(["✅ Triage Complete & Available for Query / Search"])
+    subgraph DBLayer["💾 Persistence Layer (SQLite)"]
+        DB[("SQLite Database: tickets.db<br/>Tenants, Tickets, JSON Embeddings")]:::storage
+    end
+
+    subgraph WorkerLayer["⚙️ Asynchronous Execution Engine"]
+        Worker["BackgroundTasks / Celery Worker<br/>Polls <code>queued</code> &bull; Sets <code>processing</code><br/><i>Stuck ticket auto-recovery (> 30s)</i>"]:::worker
+    end
+
+    subgraph PipelineLayer["🧠 Core AI Triage Pipeline"]
+        Embed["Stage 1: Vector Embedding<br/>256-dim L2-normalized float vector"]:::pipeline
+        Dup["Stage 2: Duplicate Detection<br/>7-Day window &bull; Cosine &ge; 0.90<br/>Transitive chain resolution"]:::pipeline
+        LLM["Stage 3: LLM Classification & Self-Healing Loop<br/>Classify category, priority & summary<br/>5s Timeout &bull; 1x Auto-Repair Retry on invalid schema"]:::pipeline
+    end
+
+    subgraph ModelLayer["🤖 AI Providers"]
+        Models["LLM & Embedding Models<br/>Gemini / Ollama / Local / Mock"]:::provider
+    end
+
+    subgraph Outcomes["📊 Final Ticket States"]
+        Triaged["Status: triaged<br/>Valid schema & Confidence &ge; 0.70"]:::state
+        Review["Status: needs_review<br/>Timeout / Invalid schema / Low confidence"]:::state
+    end
+
+    %% Flows
+    Client -->|"POST /tickets (x-api-key)"| Auth
+    Auth --> Validator
+    Validator --> Idemp
+    Idemp -->|"Replay detected"| Client
+    Idemp -->|"Insert status: queued"| DB
+    Idemp -->|"HTTP 202 Accepted {id, status}"| Client
+
+    DB -.->|"Picks queued ticket"| Worker
+    Worker --> Embed
+    Embed <-->|"Generate embedding"| Models
+    Embed --> Dup
+    Dup <-->|"Query 7-day customer history"| DB
+    Dup --> LLM
+    LLM <-->|"Classify with schema"| Models
+
+    LLM -->|"Success"| Triaged
+    LLM -->|"Fallback"| Review
+    Triaged -->|"Persist metadata"| DB
+    Review -->|"Persist metadata"| DB
+
+    Client <-->|"GET /tickets/search (Cosine ranking)"| DB
 ```
 
----
-
-### 4. End-to-End Sequence Diagram
-
-```mermaid
-sequenceDiagram
-    autonumber
-    actor Customer as 👤 Client / Agent
-    participant API as ⚡ FastAPI App
-    participant Auth as 🛡️ Auth Middleware
-    participant DB as 💾 SQLite DB
-    participant Worker as ⚙️ Background Worker
-    participant Triage as 🧠 Triage Service
-    participant Embed as 📐 Embedding Provider
-    participant LLM as 🤖 LLM Provider
-
-    %% 1. Ingestion Phase
-    Note over Customer, DB: 1. Ingestion & Asynchronous Enqueueing
-    Customer->>API: POST /tickets (x-api-key, Idempotency-Key, JSON payload)
-    API->>Auth: Validate tenant API key (key_acme / key_beta)
-    Auth-->>API: Tenant verified: 'acme'
-    API->>DB: Check Idempotency-Key existence
-    API->>DB: INSERT INTO tickets (status: 'queued', tenant_id: 'acme')
-    API-->>Customer: HTTP 202 Accepted {"id": "uuid", "status": "queued"}
-
-    %% 2. Background Processing
-    Note over Worker, LLM: 2. Background Worker Pickup & Pipeline Execution
-    Worker->>DB: Poll queued tickets / Atomic lock
-    Worker->>DB: UPDATE tickets SET status = 'processing'
-    Worker->>Triage: triage_ticket(ticket_id)
-
-    %% 3. Embedding Generation
-    Note over Triage, Embed: Stage 1: Vector Embedding
-    Triage->>Embed: generate_ticket_embedding(subject, body)
-    Embed-->>Triage: Return 256-dim L2-normalized float vector
-
-    %% 4. Duplicate Detection
-    Note over Triage, DB: Stage 2: 7-Day Window Duplicate Detection
-    Triage->>DB: SELECT recent tickets for customer (last 7 days, tenant_id)
-    DB-->>Triage: Candidate tickets with embeddings
-    Triage->>Triage: Compute Cosine Similarity (threshold &ge; 0.90)
-    opt Similarity &ge; 0.90
-        Triage->>DB: Traverse duplicate_of chain to canonical root ticket
-    end
-
-    %% 5. LLM Triage & Self-Healing Loop
-    Note over Triage, LLM: Stage 3: LLM Classification & Repair Loop
-    Triage->>LLM: triage(subject, body, is_retry=False) [5s timeout]
-    alt Normal Path: Valid JSON & Confidence &ge; 0.70
-        LLM-->>Triage: Return {category, priority, summary, confidence}
-        Triage->>Triage: Set status = 'triaged'
-    else Malformed Output (Schema ValidationError)
-        LLM-->>Triage: Invalid JSON / Schema mismatch
-        Triage->>LLM: triage(subject, body, is_retry=True) [Repair Retry]
-        alt Repaired Output Valid
-            LLM-->>Triage: Return repaired JSON
-            Triage->>Triage: Set status = 'triaged'
-        else Still Invalid
-            Triage->>Triage: Set status = 'needs_review', error = 'schema_invalid_after_repair'
-        end
-    else LLM Timeout (> 5.0s)
-        Triage->>Triage: Catch TimeoutError &rarr; status = 'needs_review', error = 'timeout'
-    else Low Confidence (< 0.70)
-        Triage->>Triage: Set status = 'needs_review', error = 'low_confidence'
-    end
-
-    %% 6. Persistence
-    Triage->>DB: UPDATE tickets SET status, category, priority, summary, embedding, duplicate_of...
-    Worker-->>DB: Finish ticket processing
-
-    %% 7. Retrieval & Semantic Search
-    Note over Customer, Embed: 3. Retrieval & Semantic Vector Search
-    Customer->>API: GET /tickets/{id} (x-api-key: key_acme)
-    API->>DB: SELECT * FROM tickets WHERE id = ? AND tenant_id = 'acme'
-    DB-->>API: Ticket record
-    API-->>Customer: HTTP 200 OK (Cleaned response, raw vector omitted)
-
-    Customer->>API: GET /tickets/search?q="payment failure"&limit=5
-    API->>Embed: generate_query_embedding("payment failure")
-    Embed-->>API: 256-dim query vector
-    API->>DB: Fetch triaged tickets for tenant & compute cosine rank
-    API-->>Customer: HTTP 200 OK (Ranked tickets sorted by similarity desc)
-```
-
----
-
-### 5. Detailed Stage-by-Stage Processing Breakdown
+### Stage-by-Stage Processing Breakdown
 
 | Stage | Responsibility | Failure & Fallback Handling |
 | :--- | :--- | :--- |
@@ -322,7 +111,7 @@ sequenceDiagram
 
 ---
 
-## 🏗 Directory & Architecture Overview
+## 📁 Directory Structure
 
 ```text
 .
