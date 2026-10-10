@@ -22,7 +22,7 @@ def main():
         "src.app:app",
         host=settings.HOST,
         port=settings.PORT,
-        reload=False,
+        reload=True,
     )
 
 
